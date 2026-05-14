@@ -100,6 +100,31 @@ describe("translateAnthropicMessagesToResponsesPayload", () => {
     expect(result.prompt_cache_key).toBe("7d0e2f61-4b5c-4a9d-8f11-2c3d4e5f6a7b")
   })
 
+  it("falls back to an empty object schema when a tool is missing input_schema", () => {
+    const result = translateAnthropicMessagesToResponsesPayload({
+      model: "gpt-4.1",
+      max_tokens: 128,
+      messages: [{ role: "user", content: "hello" }],
+      tools: [
+        {
+          name: "RunQuery",
+        },
+      ] as AnthropicMessagesPayload["tools"],
+    })
+
+    expect(result.tools).toEqual([
+      {
+        type: "function",
+        name: "RunQuery",
+        parameters: {
+          type: "object",
+          properties: {},
+        },
+        strict: false,
+      },
+    ])
+  })
+
   it("maps tool_reference tool results into function_call_output text", () => {
     const result = translateAnthropicMessagesToResponsesPayload({
       model: "gpt-4.1",

@@ -130,6 +130,37 @@ describe("Anthropic to OpenAI translation logic", () => {
     expect(isValidChatCompletionRequest(openAIPayload)).toBe(true)
   })
 
+  test("should tolerate tools without input_schema", () => {
+    const anthropicPayload: AnthropicMessagesPayload = {
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "Hello!" }],
+      max_tokens: 32,
+      tools: [
+        {
+          name: "lookupUser",
+          description: "Lookup a user by id",
+        },
+      ] as AnthropicMessagesPayload["tools"],
+    }
+
+    const openAIPayload = translateToOpenAI(anthropicPayload)
+
+    expect(isValidChatCompletionRequest(openAIPayload)).toBe(true)
+    expect(openAIPayload.tools).toEqual([
+      {
+        type: "function",
+        function: {
+          name: "lookupUser",
+          description: "Lookup a user by id",
+          parameters: {
+            type: "object",
+            properties: {},
+          },
+        },
+      },
+    ])
+  })
+
   test("should handle invalid types in Anthropic payload", () => {
     const anthropicPayload = {
       model: "gpt-4o",

@@ -470,12 +470,20 @@ function translateAnthropicToolsToOpenAI(
  * OpenAI's API rejects object schemas without it.
  */
 export const normalizeToolSchema = (
-  schema: Record<string, unknown>,
+  schema: unknown,
 ): Record<string, unknown> => {
-  if (schema.type === "object" && !schema.properties) {
-    return { ...schema, properties: {} }
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    return {
+      type: "object",
+      properties: {},
+    }
   }
-  return schema
+
+  const objectSchema = schema as Record<string, unknown>
+  if (objectSchema.type === "object" && !objectSchema.properties) {
+    return { ...objectSchema, properties: {} }
+  }
+  return objectSchema
 }
 
 function translateAnthropicToolChoiceToOpenAI(
