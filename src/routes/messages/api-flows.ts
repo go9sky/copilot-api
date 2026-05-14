@@ -202,6 +202,7 @@ export const handleWithResponsesApi = async (
     return streamSSE(c, async (stream) => {
       const streamState = createResponsesStreamState()
       let usage: UsageTokens = {}
+      let bufferedResponsesEventData: string | null = null
 
       for await (const chunk of response) {
         const eventName = chunk.event
@@ -217,7 +218,17 @@ export const handleWithResponsesApi = async (
 
         debugLazy(logger, () => ["Responses raw stream event:", data])
 
-        const responseEvent = JSON.parse(data) as ResponseStreamEvent
+        const parsed = consumeResponsesStreamEvent({
+          data,
+          bufferedData: bufferedResponsesEventData,
+          logger,
+        })
+        bufferedResponsesEventData = parsed.bufferedData
+        const responseEvent = parsed.responseEvent
+        if (!responseEvent) {
+          continue
+        }
+
         if (
           responseEvent.type === "response.completed"
           || responseEvent.type === "response.failed"
@@ -240,6 +251,12 @@ export const handleWithResponsesApi = async (
           logger.debug("Message completed, ending stream")
           break
         }
+      }
+
+      if (bufferedResponsesEventData) {
+        logger.warn(
+          "Responses stream ended with an incomplete buffered event fragment",
+        )
       }
 
       if (!streamState.messageCompleted) {
@@ -425,6 +442,8 @@ const getMetadataSessionId = (
   payload: AnthropicMessagesPayload,
 ): string | null => parseUserIdMetadata(payload.metadata?.user_id).sessionId
 
+const MAX_BUFFERED_RESPONSES_EVENT_LENGTH = 256 * 1024
+
 const parseAnthropicStreamEvent = (
   data: string,
 ): AnthropicStreamEventData | null => {
@@ -432,5 +451,85 @@ const parseAnthropicStreamEvent = (
     return JSON.parse(data) as AnthropicStreamEventData
   } catch {
     return null
+  }
+}
+
+const parseResponsesStreamEvent = (
+  data: string,
+): ResponseStreamEvent | null => {
+  try {
+    return JSON.parse(data) as ResponseStreamEvent
+  } catch {
+    return null
+  }
+}
+
+const consumeResponsesStreamEvent = ({
+  data,
+  bufferedData,
+  logger,
+}: {
+  data: string
+  bufferedData: string | null
+  logger: ConsolaInstance
+}): {
+  responseEvent: ResponseStreamEvent | null
+  bufferedData: string | null
+} => {
+  if (bufferedData) {
+    const combinedData = bufferedData + data
+    const combinedEvent = parseResponsesStreamEvent(combinedData)
+    if (combinedEvent) {
+      return {
+        responseEvent: combinedEvent,
+        bufferedData: null,
+      }
+    }
+
+    const currentEvent = parseResponsesStreamEvent(data)
+    if (currentEvent) {
+      logger.warn(
+        "Dropping malformed buffered Responses stream fragment and continuing with the current event",
+      )
+      return {
+        responseEvent: currentEvent,
+        bufferedData: null,
+      }
+    }
+
+    if (combinedData.length > MAX_BUFFERED_RESPONSES_EVENT_LENGTH) {
+      logger.warn("Dropping oversized malformed Responses stream fragment")
+      return {
+        responseEvent: null,
+        bufferedData: null,
+      }
+    }
+
+    return {
+      responseEvent: null,
+      bufferedData: combinedData,
+    }
+  }
+
+  const responseEvent = parseResponsesStreamEvent(data)
+  if (responseEvent) {
+    return {
+      responseEvent,
+      bufferedData: null,
+    }
+  }
+
+  if (data.length > MAX_BUFFERED_RESPONSES_EVENT_LENGTH) {
+    logger.warn("Dropping oversized malformed Responses stream event")
+    return {
+      responseEvent: null,
+      bufferedData: null,
+    }
+  }
+
+  logger.debug("Buffering malformed Responses stream event fragment")
+  return {
+    responseEvent: null,
+    bufferedData: data,
   }
 }
