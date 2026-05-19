@@ -3,6 +3,11 @@ import { Hono } from "hono"
 
 import type { AnthropicMessagesPayload } from "../src/routes/messages/anthropic-types"
 
+import {
+  compactSummaryPromptStart,
+  compactTextOnlyGuard,
+} from "../src/lib/compact"
+
 const actualStateModule = await import("../src/lib/state")
 const actualConfigModule = await import("../src/lib/config")
 const actualModelsModule = await import("../src/lib/models")
@@ -16,12 +21,14 @@ const state = {
 }
 
 let messagesApiEnabled = true
+let modelMappings: Record<string, string> = {}
 type SelectedModel = {
   id: string
   supported_endpoints?: Array<string>
 }
 
 type FlowCallOptions = {
+  compactType?: number
   requestId: string
   sessionId?: string
   subagentMarker?: unknown
@@ -31,6 +38,7 @@ type FlowCallOptions = {
 let selectedModel: SelectedModel | undefined
 
 const findEndpointModel = mock((_: string) => selectedModel)
+const checkRateLimit = mock(async () => {})
 const handleWithMessagesApi = mock(
   (
     _c: unknown,
@@ -59,12 +67,13 @@ await mock.module("~/lib/state", () => ({
 }))
 await mock.module("~/lib/rate-limit", () => ({
   ...actualRateLimitModule,
-  checkRateLimit: async () => {},
+  checkRateLimit,
 }))
 await mock.module("~/lib/config", () => ({
   ...actualConfigModule,
   getSmallModel: () => "small-model",
   isMessagesApiEnabled: () => messagesApiEnabled,
+  resolveMappedModel: (model: string) => modelMappings[model] ?? model,
 }))
 await mock.module("~/lib/models", () => ({
   ...actualModelsModule,
@@ -98,12 +107,14 @@ beforeEach(() => {
   state.manualApprove = false
   state.verbose = false
   messagesApiEnabled = true
+  modelMappings = {}
   selectedModel = undefined
 
   messagesFlowHandlers.handleWithMessagesApi = handleWithMessagesApi
   messagesFlowHandlers.handleWithResponsesApi = handleWithResponsesApi
   messagesFlowHandlers.handleWithChatCompletions = handleWithChatCompletions
 
+  checkRateLimit.mockClear()
   findEndpointModel.mockClear()
   handleWithMessagesApi.mockClear()
   handleWithResponsesApi.mockClear()
@@ -174,6 +185,131 @@ describe("messages handler orchestration", () => {
     ])
   })
 
+  test("adds cache_control to the last content block after merging tool_result content", async () => {
+    selectedModel = {
+      id: "messages-model",
+      supported_endpoints: ["/v1/messages"],
+    }
+
+    const payload: AnthropicMessagesPayload = {
+      model: "original-model",
+      max_tokens: 128,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "tool-1",
+              content: "Launching skill: foo",
+            },
+            {
+              type: "text",
+              text: "[Pasted ~4 lines]",
+            },
+          ],
+        },
+      ],
+    }
+
+    const app = createApp()
+    const response = await app.request("/", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe("messages")
+
+    const [, forwardedPayload] = handleWithMessagesApi.mock.calls[0]
+    expect(forwardedPayload.messages[0]).toEqual({
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "tool-1",
+          content: "Launching skill: foo\n\n[Pasted ~4 lines]",
+          cache_control: {
+            type: "ephemeral",
+          },
+        },
+      ],
+    })
+  })
+
+  test("preserves cache_control captured before Tool loaded is stripped", async () => {
+    selectedModel = {
+      id: "messages-model",
+      supported_endpoints: ["/v1/messages"],
+    }
+
+    const payload: AnthropicMessagesPayload = {
+      model: "original-model",
+      max_tokens: 128,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "tool-1",
+              content: [
+                {
+                  type: "tool_reference",
+                  tool_name: "AskUserQuestion",
+                },
+              ],
+            },
+            {
+              type: "text",
+              text: "Tool loaded.",
+              cache_control: {
+                type: "ephemeral",
+                scope: "user",
+              },
+            },
+          ],
+        },
+      ],
+    }
+
+    const app = createApp()
+    const response = await app.request("/", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe("messages")
+
+    const [, forwardedPayload] = handleWithMessagesApi.mock.calls[0]
+    expect(forwardedPayload.messages[0]).toEqual({
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "tool-1",
+          content: [
+            {
+              type: "tool_reference",
+              tool_name: "AskUserQuestion",
+            },
+          ],
+          cache_control: {
+            type: "ephemeral",
+            scope: "user",
+          },
+        },
+      ],
+    })
+  })
+
   test("delegates to the Messages API flow when the model supports /v1/messages", async () => {
     selectedModel = {
       id: "messages-model",
@@ -199,6 +335,32 @@ describe("messages handler orchestration", () => {
     expect(forwardedPayload.model).toBe("messages-model")
   })
 
+  test("maps the requested model before resolving the endpoint model", async () => {
+    modelMappings = {
+      "claude-opus-4-7": "messages-model",
+    }
+    selectedModel = {
+      id: "messages-model",
+      supported_endpoints: ["/v1/messages"],
+    }
+
+    const app = createApp()
+    const response = await app.request("/", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(createPayload({ model: "claude-opus-4-7" })),
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe("messages")
+    expect(findEndpointModel).toHaveBeenCalledWith("messages-model")
+
+    const [, forwardedPayload] = handleWithMessagesApi.mock.calls[0]
+    expect(forwardedPayload.model).toBe("messages-model")
+  })
+
   test("delegates to the Responses API flow when the model supports /responses", async () => {
     selectedModel = {
       id: "responses-model",
@@ -219,6 +381,59 @@ describe("messages handler orchestration", () => {
     expect(handleWithMessagesApi).not.toHaveBeenCalled()
     expect(handleWithResponsesApi).toHaveBeenCalledTimes(1)
     expect(handleWithChatCompletions).not.toHaveBeenCalled()
+  })
+
+  test("delegates to the Responses API flow when the model supports ws:/responses", async () => {
+    selectedModel = {
+      id: "responses-ws-model",
+      supported_endpoints: ["ws:/responses"],
+    }
+
+    const app = createApp()
+    const response = await app.request("/", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(createPayload()),
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe("responses")
+    expect(handleWithMessagesApi).not.toHaveBeenCalled()
+    expect(handleWithResponsesApi).toHaveBeenCalledTimes(1)
+    expect(handleWithChatCompletions).not.toHaveBeenCalled()
+  })
+
+  test("does not delegate compact requests to a ws-only Responses API model", async () => {
+    selectedModel = {
+      id: "responses-ws-model",
+      supported_endpoints: ["ws:/responses"],
+    }
+
+    const app = createApp()
+    const response = await app.request("/", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(
+        createPayload({
+          messages: [
+            {
+              role: "user",
+              content: `${compactTextOnlyGuard}\n\n${compactSummaryPromptStart}\n\nPending Tasks:\n- one\n\nCurrent Work:\n- two`,
+            },
+          ],
+        }),
+      ),
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe("chat")
+    expect(handleWithMessagesApi).not.toHaveBeenCalled()
+    expect(handleWithResponsesApi).not.toHaveBeenCalled()
+    expect(handleWithChatCompletions).toHaveBeenCalledTimes(1)
   })
 
   test("falls back to the Chat Completions flow when no endpoint matches", async () => {

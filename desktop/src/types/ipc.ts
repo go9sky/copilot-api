@@ -26,6 +26,11 @@ export interface ServerAuthInfo {
   headerValue?: string
 }
 
+export interface ModelMappingsConfig {
+  configPath: string
+  modelMappings: Record<string, string>
+}
+
 export type TokenUsagePeriod = 'day' | 'week' | 'month'
 
 export interface TokenUsageTotals {
@@ -51,6 +56,27 @@ export interface TokenUsageSummary {
   }
   totals: TokenUsageTotals
   byModel: TokenUsageModelSummary[]
+}
+
+export interface TokenUsageDailyBucket {
+  date: string
+  start_ms: number
+  end_ms: number
+  totals: TokenUsageTotals
+  byModel: TokenUsageModelSummary[]
+}
+
+export interface TokenUsageDailySummary {
+  period: TokenUsagePeriod
+  range: {
+    start_ms: number
+    end_ms: number
+    start_utc: string
+    end_utc: string
+  }
+  totals: TokenUsageTotals
+  byModel: TokenUsageModelSummary[]
+  days: TokenUsageDailyBucket[]
 }
 
 export interface TokenUsageEventRecord {
@@ -110,10 +136,13 @@ declare global {
       stopServer: () => Promise<void>
       getSettings: () => Promise<DesktopSettings>
       saveSettings: (settings: DesktopSettings) => Promise<void>
+      getModelMappingsConfig: () => Promise<ModelMappingsConfig>
+      saveModelMappings: (modelMappings: Record<string, string>) => Promise<void>
       openUrl: (url: string) => Promise<void>
       fetchUsage: () => Promise<unknown>
       fetchModels: () => Promise<unknown>
       fetchTokenUsage: (period: TokenUsagePeriod) => Promise<unknown>
+      fetchTokenUsageDaily: (period: TokenUsagePeriod) => Promise<unknown>
       fetchTokenUsageEvents: (period: TokenUsagePeriod, page: number, pageSize: number) => Promise<unknown>
       getServerAuthInfo: () => Promise<ServerAuthInfo>
       getLogs: () => Promise<string[]>

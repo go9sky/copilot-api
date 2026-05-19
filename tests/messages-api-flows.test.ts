@@ -1,16 +1,26 @@
-import { beforeEach, expect, mock, test } from "bun:test"
+import { afterEach, beforeEach, expect, mock, test } from "bun:test"
 
 import type { AnthropicMessagesPayload } from "../src/routes/messages/anthropic-types"
+import type { Model } from "../src/services/copilot/get-models"
 import type {
   ChatCompletionResponse,
   ChatCompletionsPayload,
 } from "../src/services/copilot/create-chat-completions"
+import type {
+  CreateResponsesReturn,
+  ResponsesPayload,
+  ResponsesResult,
+  ResponsesTransport,
+} from "../src/services/copilot/create-responses"
 
-const actualChatCompletionsModule = await import(
-  "../src/services/copilot/create-chat-completions"
-)
+import { COMPACT_REQUEST } from "../src/lib/compact"
 
 let capturedPayload: ChatCompletionsPayload | null = null
+let capturedResponsesPayload: ResponsesPayload | null = null
+let capturedResponsesOptions: {
+  transport?: ResponsesTransport
+} | null = null
+let responsesApiWebSocketEnabled = true
 
 const createChatCompletions = mock(
   (payload: ChatCompletionsPayload): Promise<ChatCompletionResponse> => {
@@ -34,14 +44,31 @@ const createChatCompletions = mock(
     })
   },
 )
+const createResponses = mock(
+  (
+    payload: ResponsesPayload,
+    options: {
+      transport?: ResponsesTransport
+    },
+  ): Promise<CreateResponsesReturn> => {
+    capturedResponsesPayload = payload
+    capturedResponsesOptions = options
+    return Promise.resolve(createResponsesResult(payload.model))
+  },
+)
 
-await mock.module("~/services/copilot/create-chat-completions", () => ({
-  ...actualChatCompletionsModule,
-  createChatCompletions,
-}))
+const {
+  handleWithChatCompletions,
+  handleWithResponsesApi,
+  messagesApiFlowDependencies,
+  prepareCopilotChatCompletionsPayload,
+} = await import("../src/routes/messages/api-flows")
+const { responsesUtilsDependencies } = await import(
+  "../src/routes/responses/utils"
+)
 
-const { handleWithChatCompletions, prepareCopilotChatCompletionsPayload } =
-  await import("../src/routes/messages/api-flows")
+const defaultMessagesApiFlowDependencies = { ...messagesApiFlowDependencies }
+const defaultResponsesUtilsDependencies = { ...responsesUtilsDependencies }
 
 const logger = {
   debug: () => {},
@@ -56,7 +83,20 @@ const createContext = () =>
 
 beforeEach(() => {
   capturedPayload = null
+  capturedResponsesPayload = null
+  capturedResponsesOptions = null
+  responsesApiWebSocketEnabled = true
+  messagesApiFlowDependencies.createChatCompletions = createChatCompletions
+  messagesApiFlowDependencies.createResponses = createResponses
+  responsesUtilsDependencies.isResponsesApiWebSocketEnabled = () =>
+    responsesApiWebSocketEnabled
   createChatCompletions.mockClear()
+  createResponses.mockClear()
+})
+
+afterEach(() => {
+  Object.assign(messagesApiFlowDependencies, defaultMessagesApiFlowDependencies)
+  Object.assign(responsesUtilsDependencies, defaultResponsesUtilsDependencies)
 })
 
 test("messages Chat Completions flow adds Copilot cache control to system and latest two non-system messages", async () => {
@@ -193,4 +233,221 @@ test("Copilot Chat Completions payload preparation marks two system and latest t
       },
     },
   ])
+})
+
+test("messages Responses flow uses websocket transport by default for dual-endpoint models", async () => {
+  const payload: AnthropicMessagesPayload = {
+    max_tokens: 128,
+    messages: [{ role: "user", content: "hello" }],
+    model: "gpt-test",
+  }
+
+  const response = await handleWithResponsesApi(createContext(), payload, {
+    logger,
+    requestId: "request-1",
+    selectedModel: createModel(["/responses", "ws:/responses"]),
+  })
+
+  expect(response.status).toBe(200)
+  expect(createResponses).toHaveBeenCalledTimes(1)
+  expect(capturedResponsesOptions?.transport).toBe("websocket")
+})
+
+test("messages Responses flow keeps HTTP transport for dual-endpoint models when websocket is disabled", async () => {
+  responsesApiWebSocketEnabled = false
+  const payload: AnthropicMessagesPayload = {
+    max_tokens: 128,
+    messages: [{ role: "user", content: "hello" }],
+    model: "gpt-test",
+  }
+
+  const response = await handleWithResponsesApi(createContext(), payload, {
+    logger,
+    requestId: "request-1",
+    selectedModel: createModel(["/responses", "ws:/responses"]),
+  })
+
+  expect(response.status).toBe(200)
+  expect(createResponses).toHaveBeenCalledTimes(1)
+  expect(capturedResponsesOptions?.transport).toBe("http")
+})
+
+test("messages Responses flow keeps HTTP transport for compact requests", async () => {
+  const payload: AnthropicMessagesPayload = {
+    max_tokens: 128,
+    messages: [{ role: "user", content: "compact" }],
+    model: "gpt-test",
+  }
+
+  const response = await handleWithResponsesApi(createContext(), payload, {
+    compactType: COMPACT_REQUEST,
+    logger,
+    requestId: "request-1",
+    selectedModel: createModel(["/responses", "ws:/responses"]),
+  })
+
+  expect(response.status).toBe(200)
+  expect(createResponses).toHaveBeenCalledTimes(1)
+  expect(capturedResponsesOptions?.transport).toBe("http")
+})
+
+test("messages Responses flow keeps HTTP transport for /responses-only models", async () => {
+  const payload: AnthropicMessagesPayload = {
+    max_tokens: 128,
+    messages: [{ role: "user", content: "hello" }],
+    model: "gpt-test",
+  }
+
+  const response = await handleWithResponsesApi(createContext(), payload, {
+    logger,
+    requestId: "request-1",
+    selectedModel: createModel(["/responses"]),
+  })
+
+  expect(response.status).toBe(200)
+  expect(createResponses).toHaveBeenCalledTimes(1)
+  expect(capturedResponsesOptions?.transport).toBe("http")
+})
+
+test("messages Responses flow keeps streaming transport for deferred tool search", async () => {
+  const payload: AnthropicMessagesPayload = {
+    max_tokens: 128,
+    stream: true,
+    messages: [{ role: "user", content: "fetch a page" }],
+    model: "gpt-5.4",
+    tools: [
+      {
+        name: "mcp__tool_search__search",
+        input_schema: { type: "object" },
+      },
+      {
+        name: "mcp__fetch__fetch",
+        description: "Fetch a URL",
+        input_schema: { type: "object" },
+      },
+    ],
+  }
+
+  const response = await handleWithResponsesApi(createContext(), payload, {
+    logger,
+    requestId: "request-1",
+    selectedModel: createModel(["/responses", "ws:/responses"]),
+  })
+
+  expect(response.status).toBe(200)
+  expect(createResponses).toHaveBeenCalledTimes(1)
+  expect(capturedResponsesPayload?.stream).toBe(true)
+  expect(capturedResponsesOptions?.transport).toBe("websocket")
+})
+
+test("messages Responses flow preserves the configured tool_search alias in non-streaming responses", async () => {
+  createResponses.mockImplementationOnce(
+    (
+      payload: ResponsesPayload,
+      options: { transport?: ResponsesTransport },
+    ) => {
+      capturedResponsesPayload = payload
+      capturedResponsesOptions = options
+      return Promise.resolve({
+        ...createResponsesResult(payload.model),
+        output: [
+          {
+            id: "search-1",
+            type: "tool_search_call",
+            call_id: "call_search",
+            arguments: { names: ["mcp__fetch__fetch"] },
+            status: "completed",
+          },
+        ],
+      })
+    },
+  )
+
+  const payload: AnthropicMessagesPayload = {
+    max_tokens: 128,
+    messages: [{ role: "user", content: "fetch a page" }],
+    model: "gpt-5.4",
+    tools: [
+      {
+        name: "tool_search_search",
+        input_schema: { type: "object" },
+      },
+      {
+        name: "mcp__fetch__fetch",
+        description: "Fetch a URL",
+        input_schema: { type: "object" },
+      },
+    ],
+  }
+
+  const response = await handleWithResponsesApi(createContext(), payload, {
+    logger,
+    requestId: "request-1",
+    selectedModel: createModel(["/responses"]),
+  })
+
+  expect(response.status).toBe(200)
+  expect(await response.json()).toEqual({
+    id: "resp-test",
+    type: "message",
+    role: "assistant",
+    content: [
+      {
+        type: "tool_use",
+        id: "call_search",
+        name: "tool_search_search",
+        input: {
+          names: "mcp__fetch__fetch",
+        },
+      },
+    ],
+    model: "gpt-5.4",
+    stop_reason: "tool_use",
+    stop_sequence: null,
+    usage: {
+      input_tokens: 0,
+      output_tokens: 0,
+    },
+  })
+})
+
+const createModel = (supportedEndpoints: Array<string>): Model => ({
+  capabilities: {
+    family: "gpt",
+    limits: {
+      max_prompt_tokens: 128000,
+    },
+    object: "model_capabilities",
+    supports: {},
+    tokenizer: "o200k_base",
+    type: "chat",
+  },
+  id: "gpt-test",
+  model_picker_enabled: true,
+  name: "gpt-test",
+  object: "model",
+  preview: false,
+  supported_endpoints: supportedEndpoints,
+  vendor: "openai",
+  version: "1",
+})
+
+const createResponsesResult = (model: string): ResponsesResult => ({
+  created_at: 0,
+  error: null,
+  id: "resp-test",
+  incomplete_details: null,
+  instructions: null,
+  metadata: null,
+  model,
+  object: "response",
+  output: [],
+  output_text: "",
+  parallel_tool_calls: false,
+  status: "completed",
+  temperature: null,
+  tool_choice: "auto",
+  tools: [],
+  top_p: null,
+  usage: null,
 })

@@ -8,6 +8,7 @@ import type { SubagentMarker } from "~/lib/subagent"
 import type { Model } from "~/services/copilot/get-models"
 
 import { debugJson, debugJsonTail, debugLazy } from "~/lib/logger"
+import { resolveBridgeToolSearchName } from "~/lib/tool-search"
 import {
   createCopilotTokenUsageRecorder,
   mergeAnthropicUsage,
@@ -30,18 +31,19 @@ import {
 import {
   applyResponsesApiContextManagement,
   compactInputByLatestCompaction,
+  getResponsesTransportForModel,
   getResponsesRequestOptions,
 } from "~/routes/responses/utils"
 import {
-  createChatCompletions,
+  createChatCompletions as createCopilotChatCompletions,
   type ChatCompletionChunk,
   type ChatCompletionResponse,
   type ChatCompletionsPayload,
   type Message,
 } from "~/services/copilot/create-chat-completions"
-import { createMessages } from "~/services/copilot/create-messages"
+import { createMessages as createCopilotMessages } from "~/services/copilot/create-messages"
 import {
-  createResponses,
+  createResponses as createCopilotResponses,
   type ResponsesResult,
   type ResponseStreamEvent,
 } from "~/services/copilot/create-responses"
@@ -66,6 +68,12 @@ const COPILOT_CONTEXT_CACHE_NON_SYSTEM_MARKER_LIMIT = 2
 const COPILOT_CONTEXT_CACHE_CONTROL = {
   type: "ephemeral",
 } as const
+
+export const messagesApiFlowDependencies = {
+  createChatCompletions: createCopilotChatCompletions,
+  createMessages: createCopilotMessages,
+  createResponses: createCopilotResponses,
+}
 
 export interface FlowBaseOptions {
   logger: ConsolaInstance
@@ -100,12 +108,15 @@ export const handleWithChatCompletions = async (
   })
   debugJson(logger, "Translated OpenAI request payload:", openAIPayload)
 
-  const response = await createChatCompletions(openAIPayload, {
-    subagentMarker,
-    requestId,
-    sessionId,
-    compactType,
-  })
+  const response = await messagesApiFlowDependencies.createChatCompletions(
+    openAIPayload,
+    {
+      subagentMarker,
+      requestId,
+      sessionId,
+      compactType,
+    },
+  )
 
   if (isNonStreaming(response)) {
     debugJson(logger, "Non-streaming response from Copilot:", response)
@@ -172,8 +183,10 @@ export const handleWithResponsesApi = async (
 ) => {
   const { logger, selectedModel, ...requestOptions } = options
 
-  const responsesPayload =
-    translateAnthropicMessagesToResponsesPayload(anthropicPayload)
+  const responsesPayload = translateAnthropicMessagesToResponsesPayload(
+    anthropicPayload,
+    requestOptions.subagentMarker?.agent_id,
+  )
   const recordUsage = createCopilotUsageRecorder({
     endpoint: "responses",
     fallbackSessionId: requestOptions.sessionId,
@@ -191,16 +204,26 @@ export const handleWithResponsesApi = async (
   debugJson(logger, "Translated Responses payload:", responsesPayload)
 
   const { vision, initiator } = getResponsesRequestOptions(responsesPayload)
-  const response = await createResponses(responsesPayload, {
-    vision,
-    initiator,
-    ...requestOptions,
-  })
+  const transport =
+    getResponsesTransportForModel(selectedModel, {
+      compactType: requestOptions.compactType,
+    }) ?? "http"
+  const response = await messagesApiFlowDependencies.createResponses(
+    responsesPayload,
+    {
+      vision,
+      initiator,
+      transport,
+      ...requestOptions,
+    },
+  )
 
   if (responsesPayload.stream && isAsyncIterable(response)) {
     logger.debug("Streaming response from Copilot (Responses API)")
     return streamSSE(c, async (stream) => {
-      const streamState = createResponsesStreamState()
+      const streamState = createResponsesStreamState({
+        toolSearchName: resolveBridgeToolSearchName(anthropicPayload.tools),
+      })
       let usage: UsageTokens = {}
       let bufferedResponsesEventData: string | null = null
 
@@ -282,6 +305,9 @@ export const handleWithResponsesApi = async (
   })
   const anthropicResponse = translateResponsesResultToAnthropic(
     response as ResponsesResult,
+    {
+      toolSearchName: resolveBridgeToolSearchName(anthropicPayload.tools),
+    },
   )
   recordUsage(normalizeResponsesUsage((response as ResponsesResult).usage))
   debugJson(logger, "Translated Anthropic response:", anthropicResponse)
@@ -313,12 +339,16 @@ export const handleWithMessagesApi = async (
 
   debugJson(logger, "Translated Messages payload:", anthropicPayload)
 
-  const response = await createMessages(anthropicPayload, anthropicBetaHeader, {
-    subagentMarker,
-    requestId,
-    sessionId,
-    compactType,
-  })
+  const response = await messagesApiFlowDependencies.createMessages(
+    anthropicPayload,
+    anthropicBetaHeader,
+    {
+      subagentMarker,
+      requestId,
+      sessionId,
+      compactType,
+    },
+  )
 
   if (isAsyncIterable(response)) {
     logger.debug("Streaming response from Copilot (Messages API)")
@@ -418,7 +448,7 @@ const uniqueIndexes = (indexes: Array<number>): Array<number> => [
 ]
 
 const isNonStreaming = (
-  response: Awaited<ReturnType<typeof createChatCompletions>>,
+  response: Awaited<ReturnType<typeof createCopilotChatCompletions>>,
 ): response is ChatCompletionResponse => Object.hasOwn(response, "choices")
 
 const isAsyncIterable = <T>(value: unknown): value is AsyncIterable<T> =>

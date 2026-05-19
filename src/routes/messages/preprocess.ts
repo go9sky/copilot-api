@@ -13,12 +13,15 @@ import {
 import { getReasoningEffortForModel } from "~/lib/config"
 
 import type {
+  AnthropicAssistantContentBlock,
+  AnthropicCacheControl,
   AnthropicDocumentBlock,
   AnthropicImageBlock,
   AnthropicMessage,
   AnthropicMessagesPayload,
   AnthropicTextBlock,
   AnthropicToolResultBlock,
+  AnthropicToolResultContentBlock,
   AnthropicUserContentBlock,
 } from "./anthropic-types"
 
@@ -31,9 +34,61 @@ const IDE_GET_DIAGNOSTICS_DESCRIPTION =
 const PDF_FILE_READ_PREFIX = "PDF file read:"
 
 type AnthropicAttachmentBlock = AnthropicImageBlock | AnthropicDocumentBlock
+type AnthropicMessageContentBlock =
+  | AnthropicUserContentBlock
+  | AnthropicAssistantContentBlock
 type IndexedAttachment = {
   attachment: AnthropicAttachmentBlock
   order: number
+}
+
+const getBlockCacheControl = (
+  block: AnthropicMessageContentBlock | undefined,
+): AnthropicCacheControl | undefined => {
+  if (!block || block.type === "thinking") {
+    return undefined
+  }
+
+  const cacheControl = block.cache_control
+  if (!cacheControl || typeof cacheControl !== "object") {
+    return
+  }
+
+  return cacheControl
+}
+
+export const getLastMessageContentCacheControl = (
+  lastMessage: AnthropicMessage | undefined,
+): AnthropicCacheControl | undefined => {
+  if (!lastMessage || !Array.isArray(lastMessage.content)) {
+    return undefined
+  }
+
+  const cacheControl = getBlockCacheControl(lastMessage.content.at(-1))
+  return cacheControl ? { ...cacheControl } : undefined
+}
+
+// Apply the original last message tail's cache_control to the rewritten tail. If
+// the original tail was not marked, fall back to a default ephemeral marker.
+export const applyLastMessageCacheControl = (
+  anthropicPayload: AnthropicMessagesPayload,
+  lastMessageCacheControl: AnthropicCacheControl | undefined,
+): void => {
+  const cacheControl = lastMessageCacheControl ?? {
+    type: "ephemeral",
+  }
+
+  const lastMessage = anthropicPayload.messages.at(-1)
+  if (!lastMessage || !Array.isArray(lastMessage.content)) {
+    return
+  }
+
+  const lastBlock = lastMessage.content.at(-1)
+  if (!lastBlock || lastBlock.type === "thinking" || lastBlock.cache_control) {
+    return
+  }
+
+  lastBlock.cache_control = { ...cacheControl }
 }
 
 const getCompactCandidateText = (message: AnthropicMessage): string => {
@@ -127,7 +182,7 @@ const mergeContentWithText = (
   }
   return {
     ...tr,
-    content: [...tr.content, textBlock],
+    content: [...tr.content, stripContentBlockCacheControl(textBlock)],
   }
 }
 
@@ -143,24 +198,43 @@ const mergeContentWithTexts = (
   if (hasToolRef(tr)) {
     return tr
   }
-  return { ...tr, content: [...tr.content, ...textBlocks] }
+  return {
+    ...tr,
+    content: [...tr.content, ...textBlocks.map(stripContentBlockCacheControl)],
+  }
 }
 
 const mergeContentWithAttachments = (
   tr: AnthropicToolResultBlock,
   attachments: Array<AnthropicAttachmentBlock>,
 ): AnthropicToolResultBlock => {
+  const cleanAttachments = attachments.map(stripContentBlockCacheControl)
+
   if (typeof tr.content === "string") {
     return {
       ...tr,
-      content: [{ type: "text", text: tr.content }, ...attachments],
+      content: [{ type: "text", text: tr.content }, ...cleanAttachments],
     }
   }
 
   return {
     ...tr,
-    content: [...tr.content, ...attachments],
+    content: [...tr.content, ...cleanAttachments],
   }
+}
+
+const stripContentBlockCacheControl = <
+  T extends AnthropicToolResultContentBlock,
+>(
+  block: T,
+): T => {
+  if (!Object.hasOwn(block, "cache_control")) {
+    return block
+  }
+
+  const copy = { ...block }
+  delete copy.cache_control
+  return copy
 }
 
 const isAttachmentBlock = (
@@ -489,13 +563,10 @@ const hasToolRef = (block: AnthropicToolResultBlock) => {
 const stripCacheControl = (payload: AnthropicMessagesPayload): void => {
   if (Array.isArray(payload.system)) {
     for (const block of payload.system) {
-      const systemBlock = block as AnthropicTextBlock & {
-        cache_control?: Record<string, unknown>
-      }
-      const cacheControl = systemBlock.cache_control
+      const cacheControl = block.cache_control
       if (cacheControl && typeof cacheControl === "object") {
         const { scope, ...rest } = cacheControl
-        systemBlock.cache_control = rest
+        block.cache_control = rest
       }
     }
   }

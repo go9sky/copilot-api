@@ -8,6 +8,7 @@ const actualRateLimitModule = await import("../src/lib/rate-limit")
 const actualTokenUsageModule = await import("../src/lib/token-usage")
 
 let providerConfig: ResolvedProviderConfig | null = null
+let modelMappings: Record<string, string> = {}
 
 interface TokenCountPayload {
   model: string
@@ -32,6 +33,7 @@ const noopTokenUsageRecorder = () => {}
 await mock.module("~/lib/config", () => ({
   ...actualConfigModule,
   getProviderConfig: () => providerConfig,
+  resolveMappedModel: (model: string) => modelMappings[model] ?? model,
 }))
 
 await mock.module("~/lib/rate-limit", () => ({
@@ -110,6 +112,7 @@ beforeEach(() => {
     type: "openai-compatible",
   }
 
+  modelMappings = {}
   checkRateLimit.mockClear()
   fetchMock.mockClear()
   getTokenCount.mockClear()
@@ -123,6 +126,39 @@ afterEach(() => {
 })
 
 describe("provider/model aliases on top-level messages routes", () => {
+  test("routes mapped /v1/messages models to the provider before rate limiting", async () => {
+    modelMappings = {
+      "claude-opus-4-7": "dash/qwen-plus",
+    }
+
+    const app = createApp()
+    const response = await app.request("/v1/messages", {
+      body: JSON.stringify({
+        max_tokens: 128,
+        messages: [{ content: "hello", role: "user" }],
+        model: "claude-opus-4-7",
+      }),
+      headers: {
+        "content-type": "application/json",
+      },
+      method: "POST",
+    })
+
+    expect(response.status).toBe(200)
+    expect(checkRateLimit).not.toHaveBeenCalled()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe(
+      "https://dashscope.example/compatible-mode/v1/chat/completions",
+    )
+
+    const upstreamBody = JSON.parse((init as RequestInit).body as string) as {
+      model: string
+    }
+    expect(upstreamBody.model).toBe("qwen-plus")
+  })
+
   test("routes /v1/messages to the provider and strips the provider prefix", async () => {
     const app = createApp()
     const response = await app.request("/v1/messages", {
@@ -162,6 +198,39 @@ describe("provider/model aliases on top-level messages routes", () => {
         max_tokens: 128,
         messages: [{ content: "hello", role: "user" }],
         model: "dash/qwen-plus",
+      }),
+      headers: {
+        "content-type": "application/json",
+      },
+      method: "POST",
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({
+      input_tokens: 42,
+    })
+    expect(getTokenCount).toHaveBeenCalledTimes(1)
+
+    const [openAIPayload, selectedModel] = getTokenCount.mock.calls[0] as [
+      TokenCountPayload,
+      TokenCountModel,
+    ]
+    expect(openAIPayload.model).toBe("qwen-plus")
+    expect(selectedModel.id).toBe("qwen-plus")
+    expect(selectedModel.capabilities.tokenizer).toBe("o200k_base")
+  })
+
+  test("routes mapped /v1/messages/count_tokens models to provider token counting", async () => {
+    modelMappings = {
+      "claude-opus-4-7": "dash/qwen-plus",
+    }
+
+    const app = createApp()
+    const response = await app.request("/v1/messages/count_tokens", {
+      body: JSON.stringify({
+        max_tokens: 128,
+        messages: [{ content: "hello", role: "user" }],
+        model: "claude-opus-4-7",
       }),
       headers: {
         "content-type": "application/json",

@@ -178,6 +178,8 @@ https://github.com/caozhiyuan/copilot-api/releases
 
 下载对应平台的安装包后，在应用内登录、选择端口并启动服务，再把你的客户端指向应用里显示的本地端点即可。发布版桌面应用使用随包内置的 Electron 运行时，正常使用不需要额外安装 Node.js；token usage 历史记录会在该内置运行时支持 SQLite 时启用。
 
+桌面应用里的高级配置页会通过 `GET/POST /admin/config/model-mappings` 读写模型映射。它使用的是 `auth.adminApiKey`，不是普通的 `auth.apiKeys`；应用会在服务启动并自动生成该 key 后，直接从 `config.json` 读取它来发起请求。
+
 ### 桌面应用截图
 
 下面展示了桌面应用中的首页、Token 用量统计页面：
@@ -306,7 +308,8 @@ Copilot API 现在使用子命令结构，主要命令包括：
   ```json
   {
     "auth": {
-      "apiKeys": []
+      "apiKeys": [],
+      "adminApiKey": "<startup 自动生成>"
     },
     "providers": {
       "custom": {
@@ -349,6 +352,7 @@ Copilot API 现在使用子命令结构，主要命令包括：
         }
       }
     },
+    "modelMappings": {},
     "extraPrompts": {
       "gpt-5-mini": "<built-in exploration prompt>",
       "gpt-5.3-codex": "<built-in commentary prompt>",
@@ -363,12 +367,14 @@ Copilot API 现在使用子命令结构，主要命令包括：
       "gpt-5.4-mini": "xhigh",
       "gpt-5.4": "xhigh"
     },
-    "useFunctionApplyPatch": true,
     "useMessagesApi": true,
+    "useResponsesApiWebSocket": true,
     "useResponsesApiWebSearch": true
   }
   ```
-- **auth.apiKeys：** 用于请求认证的 API key。支持多个 key 轮换使用。请求可通过 `x-api-key: <key>` 或 `Authorization: Bearer <key>` 进行认证。若为空或省略，则禁用认证。
+- **auth.apiKeys：** 用于普通非 admin 路由的 API key。支持多个 key 轮换使用。请求可通过 `x-api-key: <key>` 或 `Authorization: Bearer <key>` 进行认证。若为空或省略，则普通路由的认证会被禁用。
+- **auth.adminApiKey：** 仅用于 `/admin/*` 路由的单个 admin key。若未配置，服务会在启动时自动生成一个随机 key，并回写到 `config.json`。它同样使用 `x-api-key` 或 `Authorization: Bearer` 这两种头，但普通 `auth.apiKeys` 不能访问 `/admin/*`。
+- **modelMappings：** 用于顶层 `POST /v1/messages` 和 `POST /v1/messages/count_tokens` 请求的精确 `sourceModel -> targetModel` 重写映射。省略该字段或保留为 `{}` 时，不会做模型重写。`source` 和 `target` 都必须是非空字符串。`target` 可以是普通模型 ID，也可以是 `provider/model` 形式的别名，例如 `dashscope/qwen3.6-plus`；重写发生在 provider alias 解析之前。`GET/POST /admin/config/model-mappings` 管理接口读写的也只有这个字段。
 - **extraPrompts：** `model -> prompt` 的映射。把 Anthropic 风格请求翻译给 Copilot 时，会将其附加到第一条 system prompt 后面。你可以借此为不同模型注入护栏或指引。缺失的默认项会自动补齐，但不会覆盖你自定义的 prompt。内置的 `gpt-5.3-codex` 和 `gpt-5.4` prompt 会启用带阶段感知的 commentary，让模型在工具调用或更深层推理前先发出简短的用户可见进度说明。
 - **providers：** 全局上游 provider 映射。每个 provider key（例如 `custom`）都会变成一个路由前缀（`/custom/v1/messages`）。支持 `type: "anthropic"` 和 `type: "openai-compatible"`。顶层 Anthropic 客户端也可以在 `/v1/messages` 和 `/v1/messages/count_tokens` 中使用 `model: "custom/model-id"`；代理会在转发上游前移除 `custom/` 前缀。`GET /v1/models` 不聚合 provider 模型；provider 模型列表请使用 `GET /custom/v1/models`。
   - `enabled`：可选，若省略则默认为 `true`。
@@ -380,15 +386,15 @@ Copilot API 现在使用子命令结构，主要命令包括：
     - `temperature`：可选，当请求未指定时使用的默认温度。
     - `topP`：可选，当请求未指定时使用的默认 `top_p`。
     - `topK`：可选，当请求未指定时使用的默认 `top_k`。
-    - `extraBody`：可选，按模型合入上游请求体的动态字段；请求体显式同名字段优先。OpenAI 兼容 provider 可用它配置 `enable_thinking`、`preserve_thinking`、`reasoning_effort` 等字段。
+    - `extraBody`：可选，按模型合入上游请求体的动态字段；请求体显式同名字段优先。OpenAI 兼容 provider 可用它配置 `enable_thinking`、`preserve_thinking`、`reasoning_effort` 等字段。`thinking_budget` 是 OpenAI 兼容 provider 的特殊覆盖项：配置在 `extraBody` 后，会在 Anthropic `thinking.budget_tokens` 翻译之后强制写入，并覆盖请求派生出的预算值。
     - `contextCache`：可选，OpenAI 兼容 provider 默认 `true`，用于启用阿里云百炼/DashScope 的显式缓存（explicit context cache），会按其 Context Cache 格式在最多 4 个 content block 上注入 `cache_control: { "type": "ephemeral" }`。缓存断点策略与 opencode 主链路保持一致：前 2 条 system 消息 + 最后 2 条非 system 消息。标记字符串 content 时会把 `system` / `user` / `assistant` / `tool` 消息转换为 text content part 数组；已有数组 content 则标记最后一个 part。如果模型本身已经支持隐式缓存，或上游不支持该显式缓存扩展字段，可在模型配置中设为 `false`。
     - `supportPdf`：可选，控制该模型是否支持 PDF/document content。默认 `false`，不支持时会把 PDF 转成提示文本；设为 `true` 时会把 PDF/document 转成 OpenAI Chat Completions 的 file part。
     - `toolContentSupportType`：可选，配置该模型的 tool result content 支持能力，值为 `array`、`image`、`pdf` 的数组。provider 侧未配置时默认只发送 string tool content。若 `supportPdf` 为 `true` 但这里不包含 `pdf`，tool result 里的 file part 会被转成 user role 消息。Copilot 主链路不使用这个 provider 默认，仍按 array + image 且不支持 PDF 的能力处理。
 - **smallModel：** 无工具预热消息的回退模型（例如 Claude Code 的探测请求），用于避免消耗 premium requests；默认是 `gpt-5-mini`。
 - **responsesApiContextManagementModels：** 需要启用 Responses API `context_management` 压缩指令的 GPT 模型 ID 列表。默认是 `[]`，需要你显式开启。一个不错的起点是 `["gpt-5-mini", "gpt-5.3-codex", "gpt-5.4-mini", "gpt-5.4"]`。启用后，请求体会带上 `context_management`，并在后续轮次中仅保留最新的压缩承载内容。实际压缩由服务端完成，看起来会在 usage 接近模型 `maxPromptTokens` 的约 90% 时开始，因此特别适合长任务场景，同时不会额外消耗 premium requests。实践中 `compact_threshold` 似乎也是服务端固定的，所以在本项目中修改它目前不会改变压缩行为。当前该优化仅面向 GPT 系模型。
 - **modelReasoningEfforts：** 按模型配置发送到 Copilot Responses API 的 `reasoning.effort`。可选值包括 `none`、`minimal`、`low`、`medium`、`high` 和 `xhigh`。若某模型未配置，则默认使用 `high`。
-- **useFunctionApplyPatch：** 当为 `true` 时，服务端会把 Responses payload 中任何名为 `apply_patch` 的自定义工具转换为 OpenAI 风格的函数工具（`type: "function"`），并附带参数 schema，从而让 assistant 可以通过 function-calling 语义调用它来编辑文件。若设为 `false`，则保持工具原样。默认值为 `true`。
 - **useMessagesApi：** 当为 `true` 时，支持 Copilot 原生 `/v1/messages` 的 Claude 系模型会走 Messages API；否则回退到 `/chat/completions`。设为 `false` 可禁用 Messages API 路由，始终使用 `/chat/completions`。默认值为 `true`。
+- **useResponsesApiWebSocket：** 当为 `true` 时，Responses API 请求会优先对声明了 `ws:/responses` 的模型使用 Copilot websocket transport；仅声明 `/responses` 的模型仍走 HTTP。设为 `false` 可禁用 websocket 路由，并在模型支持 `/responses` 时使用 HTTP `/responses`。默认值为 `true`。
 - **useResponsesApiWebSearch：** 当为 `true` 时，服务端会保留 Responses API 中 `type: "web_search"` 的工具并透传到上游。设为 `false` 则会从 `/responses` payload 中移除这些工具。默认值为 `true`。
 - **claudeTokenMultiplier：** 用于 Claude `/v1/messages/count_tokens` 请求在本地走 GPT tokenizer 估算时的乘数。默认值为 `1.15`。如果你的客户端仍然过晚触发上下文压缩，可以适当调大。这个配置只会在代理本地估算 Claude token 时生效；如果已经配置 `anthropicApiKey` 且 Anthropic token counting 调用成功，则会直接返回 Anthropic 的精确计数，不会使用这个乘数。
 - **anthropicApiKey：** 用于精确 Claude token 计数的 Anthropic API key（参见下方 [精确的 Claude Token 计数](#accurate-claude-token-counting)）。也可通过环境变量 `ANTHROPIC_API_KEY` 设置。若未配置，则回退到 GPT tokenizer 估算。
@@ -397,18 +403,26 @@ Copilot API 现在使用子命令结构，主要命令包括：
 
 ## API 认证
 
-- **受保护路由：** 当配置了 `auth.apiKeys` 且非空时，除 `/`、`/usage-viewer` 和 `/usage-viewer/` 以外的所有路由都需要认证。
+- **受保护的普通路由：** 当配置了 `auth.apiKeys` 且非空时，除 `/`、`/usage-viewer` 和 `/usage-viewer/` 以外的普通路由都需要认证。
+- **Admin 路由：** 所有 `/admin/*` 路由都要求 `auth.adminApiKey`。如果缺失，服务会在启动时自动生成并在开始提供服务前写回 `config.json`。
 - **允许的认证头：**
   - `x-api-key: <your_key>`
   - `Authorization: Bearer <your_key>`
 - **CORS 预检：** `OPTIONS` 请求始终允许。
-- **未配置 key 时：** 服务会正常启动，并允许请求通过（即禁用认证）。
+- **未配置普通 key 时：** 普通路由仍可直接访问；但这条规则不适用于 `/admin/*`，后者只接受 `auth.adminApiKey`。
 
-示例请求：
+普通受保护路由的示例请求：
 
 ```sh
 curl http://localhost:4141/v1/models \
   -H "x-api-key: your_api_key"
+```
+
+Admin 路由的示例请求：
+
+```sh
+curl http://localhost:4141/admin/config/model-mappings \
+  -H "x-api-key: your_admin_api_key"
 ```
 
 ## API 端点
@@ -446,6 +460,15 @@ curl http://localhost:4141/v1/models \
 | --- | --- | --- |
 | `GET /usage` | `GET` | 获取详细的 Copilot 使用统计与额度信息。 |
 | `GET /token` | `GET` | 获取当前 API 正在使用的 Copilot token。 |
+
+### Admin / 配置端点
+
+这些端点用于本地管理操作，只接受 `auth.adminApiKey`。
+
+| 端点 | 方法 | 说明 |
+| --- | --- | --- |
+| `GET /admin/config/model-mappings` | `GET` | 返回当前 `config.json` 路径以及生效中的 `modelMappings` 映射。 |
+| `POST /admin/config/model-mappings` | `POST` | 只更新 `config.json` 里的 `modelMappings` 字段，并回传更新后的结果。 |
 
 ## 使用示例
 
@@ -574,6 +597,47 @@ npx @jeffreycao/copilot-api@latest start --claude-code
 
 也可以参考 IDE 集成说明：[Add Claude Code to your IDE](https://docs.anthropic.com/en/docs/claude-code/ide-integrations)
 
+## GPT Tool Search
+
+对于 `gpt-5.4+` 这类 GPT Responses 模型，本代理可以通过一个很小的 MCP bridge 暴露 Responses `tool_search`。Claude Code 和 opencode 都可以使用同一个 bridge，前提是客户端会加载 MCP server，并且 Anthropic Messages 流量会经过本代理。
+
+GPT 模型不要设置 Claude Code 原生的 `ENABLE_TOOL_SEARCH`。这个开关启用的是 Claude Code 自己的客户端 tool search 模式，可能导致 deferred 工具定义不再转发给代理。本代理需要完整的工具定义，这样才能只保留那一小组常驻加载工具，其余工具统一转换为 Responses deferred namespace。
+
+如果你安装了 `tool-search@copilot-api-marketplace`，Claude Code 会自动带上这个 MCP bridge，可以跳过下面这段 Claude Code MCP 手动配置。
+
+请把 tool search bridge 加到 Claude Code 使用的 MCP 配置中：
+
+```json
+{
+  "mcpServers": {
+    "tool_search": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@jeffreycao/copilot-api@latest", "mcp"]
+    }
+  }
+}
+```
+
+请把 tool search bridge 加到 opencode 使用的 MCP 配置中：
+
+```json
+{
+  "mcp": {
+    "tool_search": {
+      "type": "local",
+      "command": ["npx", "-y", "@jeffreycao/copilot-api@latest", "mcp"]
+    }
+  }
+}
+```
+
+本地开发时可以将命令换成 `bun`，参数换成 `["run", "./src/main.ts", "mcp"]`。
+
+代理内部现在会把 OpenAI Responses `tool_search` 配置成 client-executed 模式。deferred tools 仍然会作为可搜索 namespace 暴露给模型，但会明确要求模型直接返回下一步要加载的精确工具名列表。
+
+该 bridge 使用直接工具选择，不做 query 搜索。工具入参是 `names`，值为逗号分隔的精确 deferred 工具名，例如 `TaskList,TaskGet,mcp__fetch__fetch`。
+
 ## 与 OpenCode 一起使用
 
 OpenCode 已经有直接的 GitHub Copilot provider。本节适用于你希望让 OpenCode 通过 `@ai-sdk/anthropic` 指向这个代理，并复用本 README 前面提到的 agent 行为时。
@@ -672,10 +736,13 @@ npx @jeffreycao/copilot-api@latest --oauth-app=opencode start
 
 #### Claude Code 插件集成（基于 marketplace）
 
-Claude Code 集成被打包为名为 `claude-plugin` 的插件。
+Claude Code 集成现在拆分为两个插件：
+
+- `agent-inject` 会在 `SubagentStart` 时注入 `__SUBAGENT_MARKER__...`，以便本代理推导 `x-initiator: agent`。
+- `tool-search` 会注册用于 GPT Responses deferred tool loading 的 `tool_search` MCP bridge。
 
 - 本仓库中的 marketplace catalog：`.claude-plugin/marketplace.json`
-- 本仓库中的插件源码：`claude-plugin`
+- 本仓库中的插件源码：`claude-plugin/agent-inject`、`claude-plugin/tool-search`
 
 远程添加 marketplace：
 
@@ -686,15 +753,18 @@ Claude Code 集成被打包为名为 `claude-plugin` 的插件。
 从 marketplace 安装插件：
 
 ```sh
-/plugin install claude-plugin@copilot-api-marketplace
+/plugin install agent-inject@copilot-api-marketplace
+/plugin install tool-search@copilot-api-marketplace
 ```
 
-安装后，插件会在 `SubagentStart` 时注入 `__SUBAGENT_MARKER__...`，该代理会利用它推导 `x-initiator: agent`。
+安装后，`agent-inject` 会在 `SubagentStart` 时注入 `__SUBAGENT_MARKER__...`，该代理会利用它推导 `x-initiator: agent`。
 
-插件还会注册一个 `UserPromptSubmit` hook，并返回 `{"continue": true}`；同时它也可以通过环境变量注入 `SessionStart` reminder 规则：
+`agent-inject` 还会注册一个 `UserPromptSubmit` hook，并返回 `{"continue": true}`；同时它也可以通过环境变量注入 `SessionStart` reminder 规则：
 
 - `CLAUDE_PLUGIN_ENABLE_QUESTION_RULES=1` 会自动为 Claude Code 启用两条关于使用 `question` 工具的提醒。你也可以把同样的提醒手动写进 `CLAUDE.md`；见 [CLAUDE.md 或 AGENTS.md 推荐内容](#claudemd-or-agentsmd-recommended-content)。
 - `CLAUDE_PLUGIN_ENABLE_NO_BACKGROUND_AGENTS_RULE=1` 会启用关于避免在 agent hooks 中使用 `run_in_background: true` 的提醒。
+
+`tool-search` 插件内置了 [GPT Tool Search](#gpt-tool-search) 一节描述的同一个 MCP bridge，因此安装该插件后，Claude Code 用户无需再手动配置 `tool_search` server。
 
 #### Opencode 插件
 

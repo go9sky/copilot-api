@@ -3,9 +3,9 @@ import type { Context } from "hono"
 import { streamSSE } from "hono/streaming"
 
 import { awaitApproval } from "~/lib/approval"
-import { getConfig, isResponsesApiWebSearchEnabled } from "~/lib/config"
+import { isResponsesApiWebSearchEnabled as isConfiguredResponsesApiWebSearchEnabled } from "~/lib/config"
 import { createHandlerLogger, debugJson, debugJsonTail } from "~/lib/logger"
-import { checkRateLimit } from "~/lib/rate-limit"
+import { checkRateLimit as checkConfiguredRateLimit } from "~/lib/rate-limit"
 import { state } from "~/lib/state"
 import {
   createCopilotTokenUsageRecorder,
@@ -14,7 +14,7 @@ import {
 } from "~/lib/token-usage"
 import { generateRequestIdFromPayload, getUUID } from "~/lib/utils"
 import {
-  createResponses,
+  createResponses as createCopilotResponses,
   type ResponsesPayload,
   type ResponsesResult,
   type ResponseStreamEvent,
@@ -24,15 +24,20 @@ import { createStreamIdTracker, fixStreamIds } from "./stream-id-sync"
 import {
   applyResponsesApiContextManagement,
   compactInputByLatestCompaction,
+  getResponsesTransportForModel,
   getResponsesRequestOptions,
 } from "./utils"
 
 const logger = createHandlerLogger("responses-handler")
 
-const RESPONSES_ENDPOINT = "/responses"
+export const responsesHandlerDependencies = {
+  checkRateLimit: checkConfiguredRateLimit,
+  createResponses: createCopilotResponses,
+  isResponsesApiWebSearchEnabled: isConfiguredResponsesApiWebSearchEnabled,
+}
 
 export const handleResponses = async (c: Context) => {
-  await checkRateLimit(state)
+  await responsesHandlerDependencies.checkRateLimit(state)
 
   const payload = await c.req.json<ResponsesPayload>()
   debugJson(logger, "Responses request payload:", payload)
@@ -49,11 +54,9 @@ export const handleResponses = async (c: Context) => {
     model: payload.model,
   })
 
-  useFunctionApplyPatch(payload)
-
   removeUnsupportedTools(payload)
 
-  if (!isResponsesApiWebSearchEnabled()) {
+  if (!responsesHandlerDependencies.isResponsesApiWebSearchEnabled()) {
     removeWebSearchTool(payload)
   }
 
@@ -62,10 +65,9 @@ export const handleResponses = async (c: Context) => {
   const selectedModel = state.models?.data.find(
     (model) => model.id === payload.model,
   )
-  const supportsResponses =
-    selectedModel?.supported_endpoints?.includes(RESPONSES_ENDPOINT) ?? false
+  const responsesTransport = getResponsesTransportForModel(selectedModel)
 
-  if (!supportsResponses) {
+  if (!responsesTransport) {
     return c.json(
       {
         error: {
@@ -91,11 +93,12 @@ export const handleResponses = async (c: Context) => {
     await awaitApproval()
   }
 
-  const response = await createResponses(payload, {
+  const response = await responsesHandlerDependencies.createResponses(payload, {
     vision,
     initiator,
     requestId,
     sessionId: sessionId,
+    transport: responsesTransport,
   })
 
   if (isStreamingRequested(payload) && isAsyncIterable(response)) {
@@ -159,38 +162,6 @@ const parseResponsesStreamEvent = (
     return JSON.parse(data) as ResponseStreamEvent
   } catch {
     return null
-  }
-}
-
-const useFunctionApplyPatch = (payload: ResponsesPayload): void => {
-  const config = getConfig()
-  const useFunctionApplyPatch = config.useFunctionApplyPatch ?? true
-  if (useFunctionApplyPatch) {
-    logger.debug("Using function tool apply_patch for responses")
-    if (Array.isArray(payload.tools)) {
-      const toolsArr = payload.tools
-      for (let i = 0; i < toolsArr.length; i++) {
-        const t = toolsArr[i]
-        if (t.type === "custom" && t.name === "apply_patch") {
-          toolsArr[i] = {
-            type: "function",
-            name: t.name,
-            description: "Use the `apply_patch` tool to edit files",
-            parameters: {
-              type: "object",
-              properties: {
-                input: {
-                  type: "string",
-                  description: "The entire contents of the apply_patch command",
-                },
-              },
-              required: ["input"],
-            },
-            strict: false,
-          }
-        }
-      }
-    }
   }
 }
 
